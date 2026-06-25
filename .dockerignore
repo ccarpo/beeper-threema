@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+state/
+.git/
+*.log
+registration.yaml
+config.json

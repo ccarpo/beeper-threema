@@ -1,0 +1,36 @@
+services:
+  threema-bridge:
+    build: .
+    container_name: threema-bridge
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./state:/app/state
+      - ./registration.yaml:/app/registration.yaml:ro
+    environment:
+      - BRIDGE_PORT=29318
+      - BRIDGE_HOMESERVER_URL=https://matrix.beeper.com/_hungryserv/ccarpo
+      - BRIDGE_REGISTRATION_FILE=/app/registration.yaml
+      - THREEMA_DATA_DIR=/app/data
+      - BRIDGE_STATE_DIR=/app/state
+    networks:
+      - bridge-net
+
+  bbctl-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.bbctl
+    container_name: bbctl-proxy
+    restart: unless-stopped
+    depends_on:
+      - threema-bridge
+    volumes:
+      - ./registration.yaml:/app/registration.yaml:ro
+      - ./bbctl-config:/root/.config/bbctl:ro
+    command: ["bbctl", "proxy", "-r", "/app/registration.yaml"]
+    networks:
+      - bridge-net
+
+networks:
+  bridge-net:
+    driver: bridge

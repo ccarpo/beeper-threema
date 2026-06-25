@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+state/
+registration.yaml
+config.json
+bbctl-config/
+*.log

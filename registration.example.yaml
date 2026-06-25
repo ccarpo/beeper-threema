@@ -1,0 +1,16 @@
+# Matrix Appservice Registration File
+# Generate a real one with: bbctl register sh-threema
+# Then copy it here or set BRIDGE_REGISTRATION_FILE env var.
+
+id: sh-threema
+url: http://localhost:29318
+as_token: CHANGE_ME_AS_TOKEN
+hs_token: CHANGE_ME_HS_TOKEN
+sender_localpart: sh-threemabot
+namespaces:
+  users:
+    - exclusive: true
+      regex: '@sh-threema_.*'
+  aliases: []
+  rooms: []
+rate_limited: false

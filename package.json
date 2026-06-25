@@ -1,0 +1,34 @@
+{
+  "name": "beeper-threema-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A Matrix appservice bridge for Threema using the multi-device protocol, designed for use with Beeper via bbctl",
+  "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "link-device": "tsx src/threema/link-device.ts",
+    "bridge": "tsx src/main.ts",
+    "dev": "tsx watch src/main.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.1.1",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
+    "express": "^4.21.0",
+    "long": "^5.3.2",
+    "protobufjs": "^7.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "tsx": "^4.19.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.6.0"
+  }
+}

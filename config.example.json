@@ -1,0 +1,10 @@
+{
+  "port": 29318,
+  "homeserver_url": "http://localhost:29331",
+  "bot_user_id": "@sh-threemabot:beeper.local",
+  "user_prefix": "@sh-threema_",
+  "user_suffix": ":beeper.local",
+  "registration_file": "./registration.yaml",
+  "threema_data_dir": "./data",
+  "state_dir": "./state"
+}
