@@ -23,9 +23,18 @@ export interface MessageMapping {
   timestamp: number;
 }
 
+export interface ReactionMapping {
+  matrixReactionEventId: string;
+  threemaMessageId: string;    // Threema message ID the reaction is on
+  roomId: string;
+  emoji: string;
+  senderGhostId: string;       // ghost user who sent the reaction on Matrix
+}
+
 interface StateData {
   rooms: RoomMapping[];
   messages: MessageMapping[];
+  reactions?: ReactionMapping[];
 }
 
 export class BridgeState {
@@ -34,6 +43,7 @@ export class BridgeState {
   private rooms: Map<string, RoomMapping> = new Map();       // roomId -> mapping
   private roomsByThreemaId: Map<string, string> = new Map(); // threemaId -> roomId
   private messages: MessageMapping[] = [];
+  private reactions: ReactionMapping[] = [];
   private dirty = false;
 
   constructor(stateDir: string) {
@@ -53,7 +63,8 @@ export class BridgeState {
           }
         }
         this.messages = data.messages ?? [];
-        console.log(`[state] Loaded ${this.rooms.size} rooms, ${this.messages.length} message mappings`);
+        this.reactions = data.reactions ?? [];
+        console.log(`[state] Loaded ${this.rooms.size} rooms, ${this.messages.length} message mappings, ${this.reactions.length} reaction mappings`);
       }
     } catch (err) {
       console.warn(`[state] Failed to load state: ${err}`);
@@ -67,6 +78,7 @@ export class BridgeState {
       const data: StateData = {
         rooms: Array.from(this.rooms.values()),
         messages: this.messages.slice(-10000), // Keep last 10k mappings
+        reactions: this.reactions.slice(-5000), // Keep last 5k reactions
       };
       fs.writeFileSync(this.stateFile, JSON.stringify(data, null, 2));
       this.dirty = false;
@@ -106,5 +118,29 @@ export class BridgeState {
 
   getMatrixEventId(threemaMessageId: string): string | undefined {
     return this.messages.find(m => m.threemaMessageId === threemaMessageId)?.matrixEventId;
+  }
+
+  getMessageMapping(threemaMessageId: string): MessageMapping | undefined {
+    return this.messages.find(m => m.threemaMessageId === threemaMessageId);
+  }
+
+  getMessageMappingByMatrixId(matrixEventId: string): MessageMapping | undefined {
+    return this.messages.find(m => m.matrixEventId === matrixEventId);
+  }
+
+  addReactionMapping(mapping: ReactionMapping): void {
+    this.reactions.push(mapping);
+    this.dirty = true;
+  }
+
+  findReaction(threemaMessageId: string, emoji: string, senderGhostId: string): ReactionMapping | undefined {
+    return this.reactions.find(
+      r => r.threemaMessageId === threemaMessageId && r.emoji === emoji && r.senderGhostId === senderGhostId,
+    );
+  }
+
+  removeReaction(matrixReactionEventId: string): void {
+    this.reactions = this.reactions.filter(r => r.matrixReactionEventId !== matrixReactionEventId);
+    this.dirty = true;
   }
 }

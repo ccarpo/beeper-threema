@@ -29,6 +29,7 @@ export interface MatrixEvent {
   content: Record<string, unknown>;
   origin_server_ts: number;
   state_key?: string;
+  redacts?: string;
 }
 
 export type MessageHandler = (event: MatrixEvent) => Promise<void>;
@@ -37,6 +38,10 @@ export class MatrixAppservice {
   private app: express.Express;
   private config: AppserviceConfig;
   private messageHandler: MessageHandler | null = null;
+  private receiptHandler: ((event: MatrixEvent) => Promise<void>) | null = null;
+  private reactionHandler: ((event: MatrixEvent) => Promise<void>) | null = null;
+  private redactionHandler: ((event: MatrixEvent) => Promise<void>) | null = null;
+  private typingHandler: ((roomId: string, userId: string, isTyping: boolean) => Promise<void>) | null = null;
   private server: ReturnType<typeof this.app.listen> | null = null;
 
   constructor(config: AppserviceConfig) {
@@ -48,6 +53,22 @@ export class MatrixAppservice {
 
   onMessage(handler: MessageHandler): void {
     this.messageHandler = handler;
+  }
+
+  onReceipt(handler: (event: MatrixEvent) => Promise<void>): void {
+    this.receiptHandler = handler;
+  }
+
+  onTyping(handler: (roomId: string, userId: string, isTyping: boolean) => Promise<void>): void {
+    this.typingHandler = handler;
+  }
+
+  onReaction(handler: (event: MatrixEvent) => Promise<void>): void {
+    this.reactionHandler = handler;
+  }
+
+  onRedaction(handler: (event: MatrixEvent) => Promise<void>): void {
+    this.redactionHandler = handler;
   }
 
   private setupRoutes(): void {
@@ -110,6 +131,25 @@ export class MatrixAppservice {
       console.log(`[appservice] Message from ${event.sender} in ${event.room_id}: ${JSON.stringify(event.content).slice(0, 100)}`);
       if (this.messageHandler) {
         await this.messageHandler(event);
+      }
+    } else if (event.type === 'm.reaction') {
+      if (this.reactionHandler) {
+        await this.reactionHandler(event);
+      }
+    } else if (event.type === 'm.room.redaction') {
+      if (this.redactionHandler) {
+        await this.redactionHandler(event);
+      }
+    } else if (event.type === 'm.receipt') {
+      if (this.receiptHandler) {
+        await this.receiptHandler(event);
+      }
+    } else if (event.type === 'm.typing') {
+      // Typing events come as EDUs with content.user_ids
+      const userIds = (event.content.user_ids ?? []) as string[];
+      const isUserTyping = userIds.includes(this.config.userId);
+      if (this.typingHandler && isUserTyping) {
+        await this.typingHandler(event.room_id, this.config.userId, true);
       }
     } else if (event.type === 'm.room.member') {
       // Handle invites to the bridge bot
@@ -373,5 +413,97 @@ export class MatrixAppservice {
       return id.toUpperCase();
     }
     return null;
+  }
+
+  async sendReadReceiptAs(roomId: string, eventId: string, userId: string): Promise<void> {
+    const url = `${this.config.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/receipt/m.read/${encodeURIComponent(eventId)}?user_id=${encodeURIComponent(userId)}`;
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.config.asToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      });
+      if (!resp.ok) {
+        const body = await resp.text();
+        console.error(`[appservice] Failed to send read receipt as ${userId}: ${resp.status} ${body}`);
+      }
+    } catch (err) {
+      console.error(`[appservice] Error sending read receipt as ${userId}:`, err);
+    }
+  }
+
+  async sendTypingAs(roomId: string, userId: string, isTyping: boolean, timeoutMs = 15000): Promise<void> {
+    const url = `${this.config.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/typing/${encodeURIComponent(userId)}?user_id=${encodeURIComponent(userId)}`;
+    try {
+      const resp = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${this.config.asToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ typing: isTyping, timeout: isTyping ? timeoutMs : undefined }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text();
+        console.error(`[appservice] Failed to send typing as ${userId}: ${resp.status} ${body}`);
+      }
+    } catch (err) {
+      console.error(`[appservice] Error sending typing as ${userId}:`, err);
+    }
+  }
+
+  async sendReactionAs(roomId: string, eventId: string, emoji: string, userId: string): Promise<string | null> {
+    const txnId = `r${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const url = `${this.config.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.reaction/${txnId}?user_id=${encodeURIComponent(userId)}`;
+    try {
+      const resp = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${this.config.asToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          'm.relates_to': {
+            rel_type: 'm.annotation',
+            event_id: eventId,
+            key: emoji,
+          },
+        }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text();
+        console.error(`[appservice] Failed to send reaction as ${userId}: ${resp.status} ${body}`);
+        return null;
+      }
+      const result = await resp.json() as { event_id: string };
+      return result.event_id;
+    } catch (err) {
+      console.error(`[appservice] Error sending reaction as ${userId}:`, err);
+      return null;
+    }
+  }
+
+  async redactEventAs(roomId: string, eventId: string, userId: string, reason?: string): Promise<void> {
+    const txnId = `x${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const url = `${this.config.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/redact/${encodeURIComponent(eventId)}/${txnId}?user_id=${encodeURIComponent(userId)}`;
+    try {
+      const resp = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${this.config.asToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ reason }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text();
+        console.error(`[appservice] Failed to redact as ${userId}: ${resp.status} ${body}`);
+      }
+    } catch (err) {
+      console.error(`[appservice] Error redacting as ${userId}:`, err);
+    }
   }
 }

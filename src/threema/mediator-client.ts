@@ -2458,6 +2458,70 @@ export class MediatorClient extends EventEmitter {
     return { sent: true };
   }
 
+  async sendDeliveryReceipt(
+    recipientIdentity: string,
+    ackedMessageId: bigint | string | number,
+    status: number,
+  ): Promise<{ sent: boolean; reason?: string }> {
+    const recipient = normalizeIdentity(recipientIdentity, 'recipientIdentity');
+    const msgId = this.requireMessageId(ackedMessageId, 'ackedMessageId');
+
+    const receiptBody = encodeDeliveryReceiptBody({
+      status,
+      messageIds: [msgId],
+    });
+    const messageType = this.resolveDeliveryReceiptMessageType();
+    const { messageId, createdAtSeconds, createdAtMillis } = this.createMessageTimestamps();
+    const nonces = this.createReflectionNonces(1);
+
+    if (!this.isLeader() || !this.csp || !this.csp.isReady()) {
+      this.requireReadyForReflecting();
+      await this.reflectOutgoingMessage({
+        conversation: { contact: recipient },
+        messageId,
+        createdAtMillis,
+        type: messageType,
+        body: receiptBody,
+        nonces,
+      });
+      console.log(`[mediator] Reflected delivery receipt (status=0x${status.toString(16)}) to ${recipient}`);
+      return { sent: true, reason: 'reflected' };
+    }
+
+    const { csp } = this.requireReadyForSending();
+    const recipientPublicKey = await this.getContactPublicKey(recipient);
+    const nonce = nonces[0]!;
+
+    const encrypted = this.encryptE2ePayload(
+      messageType,
+      receiptBody,
+      recipientPublicKey,
+      nonce,
+    );
+    const payload = this.buildOutgoingMessagePayload({
+      recipientIdentity: recipient,
+      recipientPublicKey,
+      messageId,
+      createdAtSeconds,
+      createdAtMillis,
+      flags: LEGACY_STATUS_UPDATE_MESSAGE_FLAGS,
+      nonce: encrypted.nonce,
+      encryptedBody: encrypted.encryptedBody,
+    });
+
+    await this.reflectOutgoingMessage({
+      conversation: { contact: recipient },
+      messageId,
+      createdAtMillis,
+      type: messageType,
+      body: receiptBody,
+      nonces,
+    });
+    csp.sendContainer(CSP_CONTAINER_OUTGOING_MESSAGE, payload);
+    console.log(`[mediator] Sent delivery receipt (status=0x${status.toString(16)}) to ${recipient}`);
+    return { sent: true };
+  }
+
   /**
    * Create a new group (self-only "notes" group).
    * Sends group-setup (0x4A) and group-name (0x4B) messages via reflection.

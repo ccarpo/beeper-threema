@@ -13,6 +13,11 @@ import { MatrixAppservice, type MatrixEvent } from './matrix/appservice.js';
 import { BridgeState } from './bridge-state.js';
 import { MediatorClient, type IdentityData } from './threema/mediator-client.js';
 import { resolveThreemaIdentityPath } from './threema/runtime-paths.js';
+import {
+  decodeDeliveryReceiptBody,
+  decodeReactionMessageBody,
+  legacyDeliveryStatusToEmoji,
+} from './threema/emoji-reactions.js';
 
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
 
@@ -102,6 +107,24 @@ async function handleIncomingMessage(msg: any): Promise<void> {
   // Group file message
   if (type === 0x46 && body.length > 16) {
     await bridgeIncomingGroupFile(senderIdentity, body, msg.messageId);
+    return;
+  }
+
+  // Delivery receipt (DM) — bridge read receipts to Matrix
+  if (type === 0x80) {
+    await bridgeIncomingDeliveryReceipt(senderIdentity, body);
+    return;
+  }
+
+  // Reaction (DM)
+  if (type === 0x82) {
+    await bridgeIncomingReaction(senderIdentity, body);
+    return;
+  }
+
+  // Typing indicator
+  if (type === 0x90) {
+    await bridgeIncomingTypingIndicator(senderIdentity, body);
     return;
   }
 }
@@ -244,6 +267,102 @@ async function bridgeOutgoingGroupText(
   console.log(`[bridge] Reflected group text in ${groupKey}: "${text.slice(0, 60)}"`);
 }
 
+// ─── Bridge incoming delivery receipts (Threema → Matrix) ────────────────────
+
+async function bridgeIncomingDeliveryReceipt(senderIdentity: string, body: Uint8Array): Promise<void> {
+  const receipt = decodeDeliveryReceiptBody(body);
+  if (!receipt) return;
+
+  const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
+
+  // Status 0x02 = read → Matrix read receipt
+  if (receipt.status === 0x02) {
+    for (const threemaMessageId of receipt.messageIds) {
+      const mapping = state.getMessageMapping(threemaMessageId.toString());
+      if (mapping) {
+        await appservice.sendReadReceiptAs(mapping.roomId, mapping.matrixEventId, ghostUserId);
+        console.log(`[bridge] Read receipt from ${senderIdentity} for message ${mapping.matrixEventId}`);
+      }
+    }
+    return;
+  }
+
+  // Status 0x03 (ack) / 0x04 (dec) → legacy emoji reactions (👍/👎)
+  const emoji = legacyDeliveryStatusToEmoji(receipt.status);
+  if (emoji) {
+    for (const threemaMessageId of receipt.messageIds) {
+      const mapping = state.getMessageMapping(threemaMessageId.toString());
+      if (mapping) {
+        const reactionEventId = await appservice.sendReactionAs(mapping.roomId, mapping.matrixEventId, emoji, ghostUserId);
+        if (reactionEventId) {
+          state.addReactionMapping({
+            matrixReactionEventId: reactionEventId,
+            threemaMessageId: threemaMessageId.toString(),
+            roomId: mapping.roomId,
+            emoji,
+            senderGhostId: ghostUserId,
+          });
+          console.log(`[bridge] Legacy reaction ${emoji} from ${senderIdentity} on ${mapping.matrixEventId}`);
+        }
+      }
+    }
+    return;
+  }
+
+  console.log(`[bridge] Delivery receipt from ${senderIdentity}: status=0x${receipt.status.toString(16)} (ignored)`);
+}
+
+// ─── Bridge incoming reactions (Threema → Matrix) ────────────────────────────
+
+async function bridgeIncomingReaction(senderIdentity: string, body: Uint8Array): Promise<void> {
+  const reaction = decodeReactionMessageBody(body);
+  if (!reaction) return;
+
+  const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
+  const threemaMessageId = reaction.messageId.toString();
+  const mapping = state.getMessageMapping(threemaMessageId);
+  if (!mapping) {
+    console.log(`[bridge] Reaction from ${senderIdentity}: no mapping for Threema message ${threemaMessageId}`);
+    return;
+  }
+
+  if (reaction.action === 'apply') {
+    const reactionEventId = await appservice.sendReactionAs(mapping.roomId, mapping.matrixEventId, reaction.emoji, ghostUserId);
+    if (reactionEventId) {
+      state.addReactionMapping({
+        matrixReactionEventId: reactionEventId,
+        threemaMessageId,
+        roomId: mapping.roomId,
+        emoji: reaction.emoji,
+        senderGhostId: ghostUserId,
+      });
+      state.save();
+      console.log(`[bridge] Reaction ${reaction.emoji} from ${senderIdentity} on ${mapping.matrixEventId}`);
+    }
+  } else {
+    // Withdraw: find and redact the existing reaction on Matrix
+    const existing = state.findReaction(threemaMessageId, reaction.emoji, ghostUserId);
+    if (existing) {
+      await appservice.redactEventAs(existing.roomId, existing.matrixReactionEventId, ghostUserId, 'Reaction withdrawn');
+      state.removeReaction(existing.matrixReactionEventId);
+      state.save();
+      console.log(`[bridge] Reaction ${reaction.emoji} withdrawn by ${senderIdentity} on ${mapping.matrixEventId}`);
+    }
+  }
+}
+
+// ─── Bridge incoming typing indicators (Threema → Matrix) ────────────────────
+
+async function bridgeIncomingTypingIndicator(senderIdentity: string, body: Uint8Array): Promise<void> {
+  const isTyping = body.length > 0 && body[0] === 1;
+  const roomId = state.getRoomForThreemaId(senderIdentity.toUpperCase());
+  if (!roomId) return;
+
+  const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
+  await appservice.sendTypingAs(roomId, ghostUserId, isTyping);
+  console.log(`[bridge] Typing from ${senderIdentity}: ${isTyping ? 'started' : 'stopped'}`);
+}
+
 // ─── Matrix → Threema ────────────────────────────────────────────────────────
 
 appservice.onMessage(async (event: MatrixEvent) => {
@@ -290,6 +409,94 @@ async function handleMatrixGroupMessage(event: MatrixEvent, mapping: any): Promi
   // TODO: Implement group message sending
   console.log(`[bridge] Matrix→Threema group message not yet implemented`);
 }
+
+// ─── Matrix → Threema: Read receipts ─────────────────────────────────────────
+
+appservice.onReceipt(async (event: MatrixEvent) => {
+  // m.receipt events have content like: { "$eventId": { "m.read": { "@user:server": { ts: 123 } } } }
+  const content = event.content as Record<string, Record<string, Record<string, unknown>>>;
+  for (const [eventId, receiptTypes] of Object.entries(content)) {
+    const readReceipts = receiptTypes['m.read'];
+    if (!readReceipts) continue;
+
+    // Only care about the real user's read receipts
+    if (!(config.appservice.userId in readReceipts)) continue;
+
+    const mapping = state.getRoomMapping(event.room_id);
+    if (!mapping || mapping.isGroup) continue;
+
+    const msgMapping = state.getMessageMappingByMatrixId(eventId);
+    if (!msgMapping) continue;
+
+    try {
+      await mediator.sendDeliveryReceipt(mapping.threemaId, BigInt(msgMapping.threemaMessageId), 0x02);
+      console.log(`[bridge] Read receipt → Threema: ${mapping.threemaId} for ${eventId}`);
+    } catch (err) {
+      console.error(`[bridge] Failed to send read receipt to ${mapping.threemaId}:`, err);
+    }
+  }
+});
+
+// ─── Matrix → Threema: Typing indicators ─────────────────────────────────────
+
+appservice.onTyping(async (roomId: string, _userId: string, isTyping: boolean) => {
+  const mapping = state.getRoomMapping(roomId);
+  if (!mapping || mapping.isGroup) return;
+
+  try {
+    await mediator.sendTypingIndicator(mapping.threemaId, isTyping);
+    console.log(`[bridge] Typing → Threema: ${mapping.threemaId} ${isTyping ? 'started' : 'stopped'}`);
+  } catch (err) {
+    // Typing failures are non-critical (e.g. CSP not ready)
+  }
+});
+
+// ─── Matrix → Threema: Reactions ──────────────────────────────────────────────
+
+appservice.onReaction(async (event: MatrixEvent) => {
+  const relatesTo = event.content['m.relates_to'] as { rel_type?: string; event_id?: string; key?: string } | undefined;
+  if (!relatesTo || relatesTo.rel_type !== 'm.annotation' || !relatesTo.event_id || !relatesTo.key) return;
+
+  const mapping = state.getRoomMapping(event.room_id);
+  if (!mapping || mapping.isGroup) return;
+
+  const msgMapping = state.getMessageMappingByMatrixId(relatesTo.event_id);
+  if (!msgMapping) {
+    console.log(`[bridge] Reaction on unmapped Matrix event ${relatesTo.event_id}`);
+    return;
+  }
+
+  try {
+    await mediator.sendDirectReaction(
+      mapping.threemaId,
+      BigInt(msgMapping.threemaMessageId),
+      relatesTo.key,
+      'apply',
+    );
+    console.log(`[bridge] Reaction → Threema: ${relatesTo.key} on ${mapping.threemaId} message ${msgMapping.threemaMessageId}`);
+  } catch (err) {
+    console.error(`[bridge] Failed to send reaction to ${mapping.threemaId}:`, err);
+  }
+});
+
+// ─── Matrix → Threema: Redactions (reaction withdrawal) ──────────────────────
+
+appservice.onRedaction(async (event: MatrixEvent) => {
+  const redactedEventId = event.redacts;
+  if (!redactedEventId) return;
+
+  // Check if the redacted event was a reaction we sent from Matrix
+  // (We only handle our own user's redactions to withdraw reactions)
+  const mapping = state.getRoomMapping(event.room_id);
+  if (!mapping || mapping.isGroup) return;
+
+  // Try to find the original reaction's target message via the redacted event ID
+  // The redacted event should be an m.reaction event — we need to know which Threema
+  // message it was reacting to. We don't track user-sent reactions in state (only ghost reactions),
+  // so we check if this is a reaction event by looking at the message mapping.
+  // For now, log it — full withdrawal support requires tracking user-sent reactions.
+  console.log(`[bridge] Redaction in ${event.room_id}: ${redactedEventId} (reaction withdrawal not yet fully tracked)`);
+});
 
 // ─── Room management ─────────────────────────────────────────────────────────
 

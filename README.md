@@ -152,9 +152,9 @@ npm start
 - [x] Docker deployment (no exposed ports)
 - [ ] Group chat bridging
 - [ ] Media/file message bridging (download blob → re-upload to Matrix)
-- [ ] Typing indicators
-- [ ] Read receipts / delivery receipts
-- [ ] Emoji reactions
+- [x] Typing indicators (both directions)
+- [x] Read receipts / delivery receipts (both directions)
+- [x] Emoji reactions (both directions, including legacy 👍/👎)
 - [ ] Message editing
 
 ## How It Works
