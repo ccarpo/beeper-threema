@@ -10,7 +10,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { loadConfig } from './config.js';
 import { MatrixAppservice, type MatrixEvent } from './matrix/appservice.js';
-import { BridgeState } from './bridge-state.js';
+import { BridgeState, type RoomMapping } from './bridge-state.js';
 import { MediatorClient, type IdentityData } from './threema/mediator-client.js';
 import { resolveThreemaIdentityPath } from './threema/runtime-paths.js';
 import {
@@ -51,6 +51,59 @@ function getContactDisplayName(threemaId: string): string {
   const parts = [contact.firstName, contact.lastName].filter(Boolean);
   if (parts.length > 0) return parts.join(' ');
   return threemaId;
+}
+
+// Load groups
+interface GroupInfo {
+  groupIdHex: string;
+  groupIdBytes: Uint8Array;
+  creatorIdentity: string;
+  name: string;
+  members: string[];
+}
+
+const groups: Map<string, GroupInfo> = new Map(); // "creator/groupIdHex" -> GroupInfo
+
+function longToBytes(long: { low: number; high: number }): Uint8Array {
+  const buf = new Uint8Array(8);
+  const view = new DataView(buf.buffer);
+  view.setUint32(0, long.low >>> 0, true);
+  view.setUint32(4, long.high >>> 0, true);
+  return buf;
+}
+
+const groupsPath = path.join(config.threema.dataDir, 'groups.json');
+if (fs.existsSync(groupsPath)) {
+  const rawGroups = JSON.parse(fs.readFileSync(groupsPath, 'utf-8')) as Array<{
+    groupId: { low: number; high: number; unsigned?: boolean } | string;
+    creatorIdentity: string;
+    name?: string;
+    members?: string[];
+  }>;
+  for (const g of rawGroups) {
+    const idBytes = typeof g.groupId === 'string'
+      ? Buffer.from(g.groupId, 'hex')
+      : longToBytes(g.groupId as { low: number; high: number });
+    const idHex = Buffer.from(idBytes).toString('hex');
+    const creator = g.creatorIdentity.toUpperCase();
+    const key = `${creator}/${idHex}`;
+    groups.set(key, {
+      groupIdHex: idHex,
+      groupIdBytes: new Uint8Array(idBytes),
+      creatorIdentity: creator,
+      name: g.name ?? `Group ${idHex.slice(0, 8)}`,
+      members: g.members ?? [],
+    });
+  }
+  console.log(`[bridge] Loaded ${groups.size} Threema groups`);
+}
+
+function getGroupKey(creator: string, groupIdBytes: Uint8Array): string {
+  return `${creator.toUpperCase()}/${Buffer.from(groupIdBytes).toString('hex')}`;
+}
+
+function getGroupInfo(creator: string, groupIdBytes: Uint8Array): GroupInfo | undefined {
+  return groups.get(getGroupKey(creator, groupIdBytes));
 }
 
 // ─── Threema → Matrix ────────────────────────────────────────────────────────
@@ -107,6 +160,24 @@ async function handleIncomingMessage(msg: any): Promise<void> {
   // Group file message
   if (type === 0x46 && body.length > 16) {
     await bridgeIncomingGroupFile(senderIdentity, body, msg.messageId);
+    return;
+  }
+
+  // Group setup message — updates group membership
+  if (type === 0x4a && body.length >= 16) {
+    const creator = new TextDecoder().decode(body.subarray(0, 8)).replace(/\0+$/g, '');
+    const groupIdBytes = body.subarray(8, 16);
+    const memberData = body.subarray(16);
+    await handleGroupSetup(senderIdentity, creator, groupIdBytes, memberData);
+    return;
+  }
+
+  // Group name message
+  if (type === 0x4b && body.length > 16) {
+    const creator = new TextDecoder().decode(body.subarray(0, 8)).replace(/\0+$/g, '');
+    const groupIdBytes = body.subarray(8, 16);
+    const name = new TextDecoder().decode(body.subarray(16));
+    await handleGroupName(creator, groupIdBytes, name);
     return;
   }
 
@@ -218,9 +289,26 @@ async function bridgeIncomingGroupText(
   text: string,
   messageId?: unknown,
 ): Promise<void> {
-  const groupKey = `${groupCreator}/${Buffer.from(groupIdBytes).toString('hex')}`;
-  // TODO: Implement group room creation and mapping
-  console.log(`[bridge] Group message from ${senderIdentity} in ${groupKey}: "${text.slice(0, 60)}"`);
+  const roomId = await ensureGroupRoom(groupCreator, groupIdBytes, senderIdentity);
+  if (!roomId) return;
+
+  const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
+  const eventId = await appservice.sendMessageAs(roomId, ghostUserId, {
+    msgtype: 'm.text',
+    body: text,
+  });
+
+  if (eventId && messageId !== undefined) {
+    state.addMessageMapping({
+      matrixEventId: eventId,
+      threemaMessageId: String(messageId),
+      roomId,
+      timestamp: Date.now(),
+    });
+  }
+
+  const groupKey = getGroupKey(groupCreator, groupIdBytes);
+  console.log(`[bridge] Group→Matrix: ${senderIdentity} in ${groupKey}: "${text.slice(0, 60)}"`);
 }
 
 async function bridgeIncomingGroupFile(
@@ -230,6 +318,83 @@ async function bridgeIncomingGroupFile(
 ): Promise<void> {
   // TODO: Implement group file bridging
   console.log(`[bridge] Group file from ${senderIdentity}`);
+}
+
+// ─── Handle group control messages ───────────────────────────────────────────
+
+async function handleGroupSetup(
+  senderIdentity: string,
+  creator: string,
+  groupIdBytes: Uint8Array,
+  memberData: Uint8Array,
+): Promise<void> {
+  // Member list is a sequence of 8-byte identity strings
+  const memberList: string[] = [];
+  for (let i = 0; i + 8 <= memberData.length; i += 8) {
+    const id = new TextDecoder().decode(memberData.subarray(i, i + 8)).replace(/\0+$/g, '');
+    if (id.length > 0) memberList.push(id.toUpperCase());
+  }
+
+  const key = getGroupKey(creator, groupIdBytes);
+  const idHex = Buffer.from(groupIdBytes).toString('hex');
+
+  // Update in-memory group info
+  const existing = groups.get(key);
+  if (existing) {
+    existing.members = memberList;
+  } else {
+    groups.set(key, {
+      groupIdHex: idHex,
+      groupIdBytes: new Uint8Array(groupIdBytes),
+      creatorIdentity: creator.toUpperCase(),
+      name: `Group ${idHex.slice(0, 8)}`,
+      members: memberList,
+    });
+  }
+
+  // Update room mapping if it exists
+  const roomId = state.getRoomForGroup(creator.toUpperCase(), idHex);
+  if (roomId) {
+    const mapping = state.getRoomMapping(roomId);
+    if (mapping) {
+      mapping.members = memberList;
+      state.setRoomMapping(mapping);
+      state.save();
+    }
+  }
+
+  console.log(`[bridge] Group setup for ${key}: ${memberList.length} members [${memberList.join(', ')}]`);
+}
+
+async function handleGroupName(
+  creator: string,
+  groupIdBytes: Uint8Array,
+  name: string,
+): Promise<void> {
+  const key = getGroupKey(creator, groupIdBytes);
+  const idHex = Buffer.from(groupIdBytes).toString('hex');
+
+  // Update in-memory group info
+  const existing = groups.get(key);
+  if (existing) {
+    existing.name = name;
+  } else {
+    groups.set(key, {
+      groupIdHex: idHex,
+      groupIdBytes: new Uint8Array(groupIdBytes),
+      creatorIdentity: creator.toUpperCase(),
+      name,
+      members: [],
+    });
+  }
+
+  // Update Matrix room name if room exists
+  const roomId = state.getRoomForGroup(creator.toUpperCase(), idHex);
+  if (roomId) {
+    await appservice.setRoomName(roomId, `${name} (Threema)`);
+  }
+
+  console.log(`[bridge] Group name for ${key}: "${name}"`);
 }
 
 // ─── Bridge outgoing (reflected from phone) ──────────────────────────────────
@@ -262,9 +427,25 @@ async function bridgeOutgoingGroupText(
   text: string,
   messageId?: unknown,
 ): Promise<void> {
-  // TODO: Implement outgoing group text bridging
-  const groupKey = `${groupCreator}/${Buffer.from(groupIdBytes).toString('hex')}`;
-  console.log(`[bridge] Reflected group text in ${groupKey}: "${text.slice(0, 60)}"`);
+  const roomId = await ensureGroupRoom(groupCreator, groupIdBytes);
+  if (!roomId) return;
+
+  const eventId = await appservice.sendMessageAsRealUser(roomId, {
+    msgtype: 'm.text',
+    body: text,
+  });
+
+  if (eventId && messageId !== undefined) {
+    state.addMessageMapping({
+      matrixEventId: eventId,
+      threemaMessageId: String(messageId),
+      roomId,
+      timestamp: Date.now(),
+    });
+  }
+
+  const groupKey = getGroupKey(groupCreator, groupIdBytes);
+  console.log(`[bridge] Reflected group→Matrix in ${groupKey}: "${text.slice(0, 60)}"`);
 }
 
 // ─── Bridge incoming delivery receipts (Threema → Matrix) ────────────────────
@@ -405,9 +586,41 @@ async function handleMatrixDmMessage(event: MatrixEvent, mapping: { threemaId: s
   }
 }
 
-async function handleMatrixGroupMessage(event: MatrixEvent, mapping: any): Promise<void> {
-  // TODO: Implement group message sending
-  console.log(`[bridge] Matrix→Threema group message not yet implemented`);
+async function handleMatrixGroupMessage(event: MatrixEvent, mapping: RoomMapping): Promise<void> {
+  const content = event.content;
+  const msgtype = content.msgtype as string;
+
+  if (content['com.beeper.threema.reflected']) return;
+
+  if (msgtype === 'm.text' || msgtype === 'm.notice') {
+    const text = content.body as string;
+    if (!text) return;
+
+    if (!mapping.groupCreator || !mapping.groupId || !mapping.members) {
+      console.error(`[bridge] Group mapping missing creator/id/members for ${event.room_id}`);
+      return;
+    }
+
+    const groupIdBytes = Buffer.from(mapping.groupId, 'hex');
+
+    try {
+      const messageId = await mediator.sendGroupTextMessage(
+        mapping.groupCreator,
+        new Uint8Array(groupIdBytes),
+        mapping.members,
+        text,
+      );
+      state.addMessageMapping({
+        matrixEventId: event.event_id,
+        threemaMessageId: messageId.toString(),
+        roomId: event.room_id,
+        timestamp: Date.now(),
+      });
+      console.log(`[bridge] Matrix→Threema group: ${event.sender} → ${mapping.groupCreator}/${mapping.groupId}: "${text.slice(0, 60)}"`);
+    } catch (err) {
+      console.error(`[bridge] Failed to send group message:`, err);
+    }
+  }
 }
 
 // ─── Matrix → Threema: Read receipts ─────────────────────────────────────────
@@ -556,6 +769,96 @@ async function ensureDmRoom(threemaId: string): Promise<string | null> {
   state.save();
 
   console.log(`[bridge] Created DM room ${roomId} for ${normalizedId} (${displayName})`);
+  return roomId;
+}
+
+async function ensureGroupRoom(
+  groupCreator: string,
+  groupIdBytes: Uint8Array,
+  triggerSenderIdentity?: string,
+): Promise<string | null> {
+  const creator = groupCreator.toUpperCase();
+  const idHex = Buffer.from(groupIdBytes).toString('hex');
+  const existing = state.getRoomForGroup(creator, idHex);
+  if (existing) return existing;
+
+  // Look up group info (name, members) from groups.json
+  const info = getGroupInfo(creator, groupIdBytes);
+  const groupName = info?.name ?? `Group ${idHex.slice(0, 8)}`;
+
+  // Collect members: from groups.json, plus the trigger sender if not already included
+  const memberIds = new Set<string>(info?.members?.map(m => m.toUpperCase()) ?? []);
+  memberIds.add(creator);
+  if (triggerSenderIdentity) {
+    memberIds.add(triggerSenderIdentity.toUpperCase());
+  }
+  // Remove ourselves from ghosts (we're the real user)
+  memberIds.delete(identity.identity.toUpperCase());
+
+  // Set display names for all ghost members
+  const ghostUserIds: string[] = [];
+  for (const memberId of memberIds) {
+    const ghostUserId = appservice.threemaIdToMatrixUser(memberId);
+    ghostUserIds.push(ghostUserId);
+    const displayName = getContactDisplayName(memberId);
+    await appservice.setDisplayName(ghostUserId, `${displayName} (Threema)`);
+  }
+
+  // Build power levels: all ghosts at 50, bot at 100, real user at 50
+  const powerUsers: Record<string, number> = {
+    [config.appservice.botUserId]: 100,
+    [config.appservice.userId]: 50,
+  };
+  for (const gid of ghostUserIds) {
+    powerUsers[gid] = 50;
+  }
+
+  const roomId = await appservice.createRoom({
+    name: `${groupName} (Threema)`,
+    invite: [config.appservice.userId, ...ghostUserIds],
+    is_direct: false,
+    preset: 'trusted_private_chat',
+    initial_state: [
+      {
+        type: 'm.room.power_levels',
+        content: {
+          users: powerUsers,
+          events_default: 0,
+          state_default: 50,
+          ban: 100,
+          kick: 100,
+          invite: 50,
+        },
+      },
+    ],
+  });
+
+  if (!roomId) {
+    console.error(`[bridge] Failed to create group room for ${creator}/${idHex}`);
+    return null;
+  }
+
+  // Join all ghosts
+  for (const ghostUserId of ghostUserIds) {
+    await appservice.joinRoomAs(roomId, ghostUserId);
+  }
+
+  // Accept invite as the real user
+  await appservice.joinRoomAsRealUser(roomId);
+
+  // Save mapping
+  const members = Array.from(memberIds);
+  state.setRoomMapping({
+    roomId,
+    threemaId: creator,
+    isGroup: true,
+    groupCreator: creator,
+    groupId: idHex,
+    members,
+  });
+  state.save();
+
+  console.log(`[bridge] Created group room ${roomId} for ${groupName} (${creator}/${idHex}, ${members.length} members)`);
   return roomId;
 }
 

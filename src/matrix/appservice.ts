@@ -148,8 +148,8 @@ export class MatrixAppservice {
       // Typing events come as EDUs with content.user_ids
       const userIds = (event.content.user_ids ?? []) as string[];
       const isUserTyping = userIds.includes(this.config.userId);
-      if (this.typingHandler && isUserTyping) {
-        await this.typingHandler(event.room_id, this.config.userId, true);
+      if (this.typingHandler) {
+        await this.typingHandler(event.room_id, this.config.userId, isUserTyping);
       }
     } else if (event.type === 'm.room.member') {
       // Handle invites to the bridge bot
@@ -452,6 +452,26 @@ export class MatrixAppservice {
       }
     } catch (err) {
       console.error(`[appservice] Error sending typing as ${userId}:`, err);
+    }
+  }
+
+  async setRoomName(roomId: string, name: string): Promise<void> {
+    const url = `${this.config.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.name`;
+    try {
+      const resp = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${this.config.asToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text();
+        console.error(`[appservice] Failed to set room name: ${resp.status} ${body}`);
+      }
+    } catch (err) {
+      console.error(`[appservice] Error setting room name:`, err);
     }
   }
 

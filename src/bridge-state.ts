@@ -42,6 +42,7 @@ export class BridgeState {
   private stateFile: string;
   private rooms: Map<string, RoomMapping> = new Map();       // roomId -> mapping
   private roomsByThreemaId: Map<string, string> = new Map(); // threemaId -> roomId
+  private roomsByGroupKey: Map<string, string> = new Map();  // "creator/groupIdHex" -> roomId
   private messages: MessageMapping[] = [];
   private reactions: ReactionMapping[] = [];
   private dirty = false;
@@ -60,6 +61,8 @@ export class BridgeState {
           this.rooms.set(room.roomId, room);
           if (!room.isGroup) {
             this.roomsByThreemaId.set(room.threemaId, room.roomId);
+          } else if (room.groupCreator && room.groupId) {
+            this.roomsByGroupKey.set(`${room.groupCreator}/${room.groupId}`, room.roomId);
           }
         }
         this.messages = data.messages ?? [];
@@ -99,8 +102,19 @@ export class BridgeState {
     this.rooms.set(mapping.roomId, mapping);
     if (!mapping.isGroup) {
       this.roomsByThreemaId.set(mapping.threemaId.toUpperCase(), mapping.roomId);
+    } else if (mapping.groupCreator && mapping.groupId) {
+      this.roomsByGroupKey.set(`${mapping.groupCreator}/${mapping.groupId}`, mapping.roomId);
     }
     this.dirty = true;
+  }
+
+  getRoomForGroup(groupCreator: string, groupIdHex: string): string | undefined {
+    return this.roomsByGroupKey.get(`${groupCreator}/${groupIdHex}`);
+  }
+
+  getGroupMapping(roomId: string): RoomMapping | undefined {
+    const m = this.rooms.get(roomId);
+    return m?.isGroup ? m : undefined;
   }
 
   addMessageMapping(mapping: MessageMapping): void {

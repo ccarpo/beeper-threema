@@ -150,7 +150,7 @@ npm start
 - [x] Contact display names on Matrix ghosts
 - [x] WebSocket + CSP keepalive (prevents idle disconnects)
 - [x] Docker deployment (no exposed ports)
-- [ ] Group chat bridging
+- [x] Group chat bridging (text messages, membership, room names)
 - [ ] Media/file message bridging (download blob → re-upload to Matrix)
 - [x] Typing indicators (both directions)
 - [x] Read receipts / delivery receipts (both directions)
