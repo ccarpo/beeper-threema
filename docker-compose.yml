@@ -7,6 +7,9 @@ services:
       - ./data:/app/data
       - ./state:/app/state
       - ./registration.yaml:/app/registration.yaml:ro
+      - ./bbctl-config:/root/.config/bbctl:ro
+    ports:
+      - "29318:29318"
     environment:
       - BRIDGE_PORT=29318
       - BRIDGE_HOMESERVER_URL=https://matrix.beeper.com/_hungryserv/ccarpo

@@ -9,7 +9,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { loadConfig } from './config.js';
-import { MatrixAppservice, type MatrixEvent } from './matrix/appservice.js';
+import { MatrixAppservice, type MatrixEvent, type BridgeStatus } from './matrix/appservice.js';
 import { BridgeState, type RoomMapping } from './bridge-state.js';
 import { MediatorClient, type IdentityData } from './threema/mediator-client.js';
 import { resolveThreemaIdentityPath } from './threema/runtime-paths.js';
@@ -44,10 +44,15 @@ if (fs.existsSync(contactsPath)) {
   console.log(`[bridge] Loaded ${contacts.length} Threema contacts`);
 }
 
-async function ensureGhostDisplayName(threemaId: string): Promise<void> {
+async function ensureGhostDisplayName(threemaId: string, roomId?: string): Promise<void> {
   const ghostUserId = appservice.threemaIdToMatrixUser(threemaId);
   const displayName = getContactDisplayName(threemaId);
-  await appservice.setDisplayName(ghostUserId, `${displayName} (Threema)`);
+  const fullName = `${displayName} (Threema)`;
+  await appservice.setDisplayName(ghostUserId, fullName);
+  // Also update the room-level m.room.member state, which is what clients actually display
+  if (roomId) {
+    await appservice.setRoomMemberDisplayName(roomId, ghostUserId, fullName);
+  }
 }
 
 function getContactDisplayName(threemaId: string): string {
@@ -350,7 +355,7 @@ async function bridgeIncomingGroupText(
   if (!roomId) return;
 
   // Always ensure the sender has a display name (room may have been created before they appeared)
-  await ensureGhostDisplayName(senderIdentity);
+  await ensureGhostDisplayName(senderIdentity, roomId);
 
   const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
   const eventId = await appservice.sendMessageAs(roomId, ghostUserId, {
@@ -384,7 +389,7 @@ async function bridgeIncomingGroupFile(
   const roomId = await ensureGroupRoom(creator, groupIdBytes, senderIdentity);
   if (!roomId) return;
 
-  await ensureGhostDisplayName(senderIdentity);
+  await ensureGhostDisplayName(senderIdentity, roomId);
   const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
 
   let eventId: string | null = null;
@@ -986,8 +991,29 @@ async function ensureGroupRoom(
 let reconnectAttempt = 0;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 
+// How often to yield leader to the phone (ms) and for how long
+const PHONE_SYNC_INTERVAL_MS  = 30 * 60 * 1000; // every 30 minutes
+const PHONE_SYNC_DURATION_MS  = 60 * 1000;       // yield for 60 seconds
+
+// Set to true while we are intentionally disconnected for phone sync
+let yieldingToPhone = false;
+
+async function yieldLeaderToPhone(durationMs: number, reason: string): Promise<void> {
+  if (yieldingToPhone) return; // already yielding
+  yieldingToPhone = true;
+  console.log(`[bridge] Yielding leader to phone for ${durationMs / 1000}s (reason: ${reason})`);
+  mediator.disconnect();
+  await new Promise(r => setTimeout(r, durationMs));
+  yieldingToPhone = false;
+  console.log('[bridge] Resuming — reconnecting to reclaim leader');
+}
+
 async function connectWithReconnect(): Promise<void> {
   while (true) {
+    if (yieldingToPhone) {
+      await new Promise(r => setTimeout(r, 1000));
+      continue;
+    }
     try {
       await mediator.connect();
       reconnectAttempt = 0;
@@ -1001,6 +1027,8 @@ async function connectWithReconnect(): Promise<void> {
       console.error('[bridge] Mediator connection error:', err);
     }
 
+    if (yieldingToPhone) continue;
+
     reconnectAttempt++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempt), MAX_RECONNECT_DELAY_MS);
     console.log(`[bridge] Reconnecting in ${delay}ms (attempt ${reconnectAttempt})...`);
@@ -1010,10 +1038,53 @@ async function connectWithReconnect(): Promise<void> {
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
+const startedAt = Date.now();
+
 async function main(): Promise<void> {
   console.log('[bridge] Starting beeper-threema-bridge');
   console.log(`[bridge] Appservice port: ${config.appservice.port}`);
   console.log(`[bridge] Homeserver URL: ${config.appservice.homeserverUrl}`);
+
+  appservice.setStatusProvider((): BridgeStatus => ({
+    isLeader: mediator.isLeader(),
+    cspReady: mediator.isCspReady(),
+    uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+    threemaId: identity.identity,
+    linkedAt: identity.linkedAt,
+    yieldingToPhone,
+  }));
+
+  appservice.setActionHandler(async (action, durationSeconds) => {
+    if (action === 'pause') {
+      const ms = (durationSeconds ?? 60) * 1000;
+      void yieldLeaderToPhone(ms, 'manual /pause');
+    } else if (action === 'resume') {
+      if (yieldingToPhone) {
+        yieldingToPhone = false;
+        console.log('[bridge] Manual /resume — reclaiming leader');
+      }
+    }
+  });
+
+  // Log leader/CSP status changes
+  mediator.on('promotedToLeader', () => {
+    console.log('[bridge] *** Bridge is now LEADER — receiving incoming messages ***');
+  });
+  mediator.on('cspReady', () => {
+    console.log('[bridge] *** CSP ready — bridge can send messages directly ***');
+  });
+
+  // Yield leader to phone immediately for unknown message types (calls, etc.)
+  mediator.on('unknownMessageType', ({ type, senderIdentity }: { type: number; senderIdentity: string }) => {
+    console.log(`[bridge] Unknown message type 0x${type.toString(16)} from ${senderIdentity} — yielding leader to phone for call/unknown handling`);
+    void yieldLeaderToPhone(PHONE_SYNC_DURATION_MS, `unknown message type 0x${type.toString(16)}`);
+  });
+
+  // Periodic sync: yield leader every 30 min so phone gets queued messages
+  setInterval(() => {
+    void yieldLeaderToPhone(PHONE_SYNC_DURATION_MS, 'periodic phone sync');
+  }, PHONE_SYNC_INTERVAL_MS);
+  console.log(`[bridge] Periodic phone sync every ${PHONE_SYNC_INTERVAL_MS / 60000} min for ${PHONE_SYNC_DURATION_MS / 1000}s`);
 
   await appservice.start();
 

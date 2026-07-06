@@ -1355,6 +1355,7 @@ export class MediatorClient extends EventEmitter {
       && type !== E2E_GROUP_REACTION_MESSAGE_TYPE
       && type !== E2E_TYPING_INDICATOR_MESSAGE_TYPE
     ) {
+      this.emit('unknownMessageType', { type, senderIdentity, messageId });
       return null;
     }
 

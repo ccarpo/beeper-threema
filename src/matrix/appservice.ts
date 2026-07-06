@@ -34,6 +34,15 @@ export interface MatrixEvent {
 
 export type MessageHandler = (event: MatrixEvent) => Promise<void>;
 
+export interface BridgeStatus {
+  isLeader: boolean;
+  cspReady: boolean;
+  uptimeSeconds: number;
+  threemaId: string;
+  linkedAt?: string;
+  yieldingToPhone: boolean;
+}
+
 export class MatrixAppservice {
   private app: express.Express;
   private config: AppserviceConfig;
@@ -43,6 +52,7 @@ export class MatrixAppservice {
   private redactionHandler: ((event: MatrixEvent) => Promise<void>) | null = null;
   private typingHandler: ((roomId: string, userId: string, isTyping: boolean) => Promise<void>) | null = null;
   private server: ReturnType<typeof this.app.listen> | null = null;
+  private statusProvider: (() => BridgeStatus) | null = null;
 
   constructor(config: AppserviceConfig) {
     this.config = config;
@@ -71,10 +81,47 @@ export class MatrixAppservice {
     this.redactionHandler = handler;
   }
 
+  setStatusProvider(provider: () => BridgeStatus): void {
+    this.statusProvider = provider;
+  }
+
+  private actionHandler: ((action: string, durationSeconds?: number) => Promise<void>) | null = null;
+
+  setActionHandler(handler: (action: string, durationSeconds?: number) => Promise<void>): void {
+    this.actionHandler = handler;
+  }
+
   private setupRoutes(): void {
     // Health check
     this.app.get('/_matrix/app/v1/ping', (_req: Request, res: Response) => {
       res.json({});
+    });
+
+    // Bridge status
+    this.app.get('/status', (_req: Request, res: Response) => {
+      const status = this.statusProvider ? this.statusProvider() : { isLeader: false, cspReady: false, uptimeSeconds: 0, threemaId: 'unknown', yieldingToPhone: false };
+      res.json(status);
+    });
+
+    // Yield leader to phone for N seconds (default 60)
+    this.app.post('/pause', async (req: Request, res: Response) => {
+      const seconds = Number(req.query.seconds ?? 60);
+      if (this.actionHandler) {
+        await this.actionHandler('pause', seconds);
+        res.json({ ok: true, message: `Yielding to phone for ${seconds}s` });
+      } else {
+        res.status(503).json({ error: 'No action handler registered' });
+      }
+    });
+
+    // Reclaim leader immediately
+    this.app.post('/resume', async (_req: Request, res: Response) => {
+      if (this.actionHandler) {
+        await this.actionHandler('resume');
+        res.json({ ok: true, message: 'Resuming bridge as leader' });
+      } else {
+        res.status(503).json({ error: 'No action handler registered' });
+      }
     });
 
     // Transactions from homeserver (via bbctl proxy)
@@ -429,6 +476,34 @@ export class MatrixAppservice {
       });
     } catch (err) {
       console.error(`[appservice] Error setting display name for ${userId}:`, err);
+    }
+  }
+
+  async setRoomMemberDisplayName(roomId: string, userId: string, displayName: string): Promise<void> {
+    // Update the m.room.member state event for this ghost in the specific room.
+    // Clients use the room-level membership event for display names, not the global profile.
+    // We first fetch the current membership content to preserve avatar_url etc., then PUT it back.
+    const stateUrl = `${this.config.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.member/${encodeURIComponent(userId)}?user_id=${encodeURIComponent(userId)}`;
+    try {
+      const getResp = await fetch(stateUrl, {
+        headers: { 'Authorization': `Bearer ${this.config.asToken}` },
+      });
+      const current = getResp.ok ? (await getResp.json() as Record<string, unknown>) : {};
+      const updated = { ...current, membership: 'join', displayname: displayName };
+      const putResp = await fetch(stateUrl, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${this.config.asToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(updated),
+      });
+      if (!putResp.ok) {
+        const body = await putResp.text();
+        console.error(`[appservice] Failed to set room member display name for ${userId} in ${roomId}: ${putResp.status} ${body}`);
+      }
+    } catch (err) {
+      console.error(`[appservice] Error setting room member display name for ${userId} in ${roomId}:`, err);
     }
   }
 
