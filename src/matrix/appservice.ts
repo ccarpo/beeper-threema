@@ -122,29 +122,30 @@ export class MatrixAppservice {
     if (event.sender.startsWith(this.config.userPrefix)) {
       return;
     }
-    // Skip events from the bridge bot itself
-    if (event.sender === this.config.botUserId) {
-      return;
-    }
 
-    if (event.type === 'm.room.message') {
+    // For membership events, we need to process them even when sent by the bot
+    // (e.g. bot inviting the real user → auto-accept). For all other event types,
+    // skip events originating from the bridge bot to avoid feedback loops.
+    const isBotEvent = event.sender === this.config.botUserId;
+
+    if (!isBotEvent && event.type === 'm.room.message') {
       console.log(`[appservice] Message from ${event.sender} in ${event.room_id}: ${JSON.stringify(event.content).slice(0, 100)}`);
       if (this.messageHandler) {
         await this.messageHandler(event);
       }
-    } else if (event.type === 'm.reaction') {
+    } else if (!isBotEvent && event.type === 'm.reaction') {
       if (this.reactionHandler) {
         await this.reactionHandler(event);
       }
-    } else if (event.type === 'm.room.redaction') {
+    } else if (!isBotEvent && event.type === 'm.room.redaction') {
       if (this.redactionHandler) {
         await this.redactionHandler(event);
       }
-    } else if (event.type === 'm.receipt') {
+    } else if (!isBotEvent && event.type === 'm.receipt') {
       if (this.receiptHandler) {
         await this.receiptHandler(event);
       }
-    } else if (event.type === 'm.typing') {
+    } else if (!isBotEvent && event.type === 'm.typing') {
       // Typing events come as EDUs with content.user_ids
       const userIds = (event.content.user_ids ?? []) as string[];
       const isUserTyping = userIds.includes(this.config.userId);
@@ -156,6 +157,15 @@ export class MatrixAppservice {
       if (event.state_key === this.config.botUserId && event.content.membership === 'invite') {
         console.log(`[appservice] Bot invited to ${event.room_id} by ${event.sender}`);
         await this.joinRoom(event.room_id);
+      }
+      // Auto-accept invites for the real user from the bridge bot
+      if (
+        event.state_key === this.config.userId &&
+        event.content.membership === 'invite' &&
+        event.sender === this.config.botUserId
+      ) {
+        console.log(`[appservice] Auto-accepting invite for real user to ${event.room_id}`);
+        await this.joinRoomAsRealUser(event.room_id);
       }
     }
   }
@@ -379,6 +389,30 @@ export class MatrixAppservice {
       }
     } catch (err) {
       console.error(`[appservice] Error joining room as real user:`, err);
+    }
+  }
+
+  async uploadMedia(bytes: Uint8Array, mimeType: string, fileName: string): Promise<string | null> {
+    const url = `${this.config.homeserverUrl}/_matrix/media/v3/upload?filename=${encodeURIComponent(fileName)}`;
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.config.asToken}`,
+          'Content-Type': mimeType,
+        },
+        body: bytes,
+      });
+      if (!resp.ok) {
+        const body = await resp.text();
+        console.error(`[appservice] Failed to upload media: ${resp.status} ${body}`);
+        return null;
+      }
+      const result = await resp.json() as { content_uri: string };
+      return result.content_uri;
+    } catch (err) {
+      console.error('[appservice] Error uploading media:', err);
+      return null;
     }
   }
 

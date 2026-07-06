@@ -44,6 +44,12 @@ if (fs.existsSync(contactsPath)) {
   console.log(`[bridge] Loaded ${contacts.length} Threema contacts`);
 }
 
+async function ensureGhostDisplayName(threemaId: string): Promise<void> {
+  const ghostUserId = appservice.threemaIdToMatrixUser(threemaId);
+  const displayName = getContactDisplayName(threemaId);
+  await appservice.setDisplayName(ghostUserId, `${displayName} (Threema)`);
+}
+
 function getContactDisplayName(threemaId: string): string {
   const contact = contacts.find(c => c.identity.toUpperCase() === threemaId.toUpperCase());
   if (!contact) return threemaId;
@@ -241,36 +247,78 @@ async function bridgeIncomingText(senderIdentity: string, text: string, messageI
     });
   }
 
+  // Send "received" delivery receipt so sender's Threema app shows the message as delivered
+  if (messageId !== undefined) {
+    try {
+      await mediator.sendDeliveryReceipt(senderIdentity, BigInt(String(messageId)), 0x01);
+    } catch (err) {
+      console.warn(`[bridge] Failed to send received receipt to ${senderIdentity}:`, err);
+    }
+  }
+
   console.log(`[bridge] Threema→Matrix: ${senderIdentity} → ${roomId}: "${text.slice(0, 60)}"`);
 }
 
 async function bridgeIncomingFile(senderIdentity: string, body: Uint8Array, messageId?: unknown): Promise<void> {
-  // Parse file message JSON
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(new TextDecoder().decode(body));
-  } catch {
-    return;
-  }
-
   const roomId = await ensureDmRoom(senderIdentity);
   if (!roomId) return;
 
   const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
-  const mediaType = (parsed.m as string) ?? 'application/octet-stream';
-  const fileName = (parsed.n as string) ?? 'file';
-  const caption = parsed.d as string | undefined;
 
-  // For now, send a notice about the file (full media bridging requires
-  // downloading the blob, decrypting, and re-uploading to Matrix)
-  const text = caption
-    ? `📎 Sent a file: ${fileName} (${mediaType}) — "${caption}"`
-    : `📎 Sent a file: ${fileName} (${mediaType})`;
+  let eventId: string | null = null;
+  try {
+    const resolved = await mediator.resolveDirectFileMessageBody(body);
+    if (resolved) {
+      const { descriptor, file } = resolved;
+      const mediaType = descriptor.mediaType || 'application/octet-stream';
+      const fileName = descriptor.fileName ?? 'file';
+      const caption = descriptor.caption;
 
-  const eventId = await appservice.sendMessageAs(roomId, ghostUserId, {
-    msgtype: 'm.notice',
-    body: text,
-  });
+      const mxcUri = await appservice.uploadMedia(file.bytes, mediaType, fileName);
+      if (mxcUri) {
+        const isImage = mediaType.startsWith('image/');
+        const isVideo = mediaType.startsWith('video/');
+        const isAudio = mediaType.startsWith('audio/');
+        const msgtype = isImage ? 'm.image' : isVideo ? 'm.video' : isAudio ? 'm.audio' : 'm.file';
+
+        const content: Record<string, unknown> = {
+          msgtype,
+          body: fileName,
+          url: mxcUri,
+          info: {
+            mimetype: mediaType,
+            size: file.bytes.length,
+          },
+        };
+        if (caption) content['filename'] = fileName;
+        if (caption) content['body'] = caption;
+
+        eventId = await appservice.sendMessageAs(roomId, ghostUserId, content);
+        console.log(`[bridge] File→Matrix: ${senderIdentity} sent ${fileName} (${mediaType})`);
+      } else {
+        throw new Error('upload returned null mxc URI');
+      }
+    } else {
+      throw new Error('resolveDirectFileMessageBody returned null');
+    }
+  } catch (err) {
+    console.warn(`[bridge] File download/upload failed for ${senderIdentity}, falling back to notice:`, err);
+    // Fallback: try to parse the JSON descriptor for a human-readable notice
+    let fallbackText = '📎 Sent a file';
+    try {
+      const parsed = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+      const mediaType = (parsed.m as string) ?? 'application/octet-stream';
+      const fileName = (parsed.n as string) ?? 'file';
+      const caption = parsed.d as string | undefined;
+      fallbackText = caption
+        ? `📎 Sent a file: ${fileName} (${mediaType}) — "${caption}"`
+        : `📎 Sent a file: ${fileName} (${mediaType})`;
+    } catch { /* ignore */ }
+    eventId = await appservice.sendMessageAs(roomId, ghostUserId, {
+      msgtype: 'm.notice',
+      body: fallbackText,
+    });
+  }
 
   if (eventId && messageId !== undefined) {
     state.addMessageMapping({
@@ -279,6 +327,15 @@ async function bridgeIncomingFile(senderIdentity: string, body: Uint8Array, mess
       roomId,
       timestamp: Date.now(),
     });
+  }
+
+  // Send "received" delivery receipt
+  if (messageId !== undefined) {
+    try {
+      await mediator.sendDeliveryReceipt(senderIdentity, BigInt(String(messageId)), 0x01);
+    } catch (err) {
+      console.warn(`[bridge] Failed to send received receipt to ${senderIdentity}:`, err);
+    }
   }
 }
 
@@ -291,6 +348,9 @@ async function bridgeIncomingGroupText(
 ): Promise<void> {
   const roomId = await ensureGroupRoom(groupCreator, groupIdBytes, senderIdentity);
   if (!roomId) return;
+
+  // Always ensure the sender has a display name (room may have been created before they appeared)
+  await ensureGhostDisplayName(senderIdentity);
 
   const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
   const eventId = await appservice.sendMessageAs(roomId, ghostUserId, {
@@ -316,8 +376,67 @@ async function bridgeIncomingGroupFile(
   body: Uint8Array,
   messageId?: unknown,
 ): Promise<void> {
-  // TODO: Implement group file bridging
-  console.log(`[bridge] Group file from ${senderIdentity}`);
+  // body layout: [creatorIdentity:8][groupId:8][file message JSON encrypted blob]
+  if (body.length <= 16) return;
+  const creator = new TextDecoder().decode(body.subarray(0, 8)).replace(/\0+$/g, '');
+  const groupIdBytes = body.subarray(8, 16);
+
+  const roomId = await ensureGroupRoom(creator, groupIdBytes, senderIdentity);
+  if (!roomId) return;
+
+  await ensureGhostDisplayName(senderIdentity);
+  const ghostUserId = appservice.threemaIdToMatrixUser(senderIdentity);
+
+  let eventId: string | null = null;
+  try {
+    const resolved = await mediator.resolveGroupFileMessageBody(body);
+    if (resolved) {
+      const { descriptor, file } = resolved;
+      const mediaType = descriptor.mediaType || 'application/octet-stream';
+      const fileName = descriptor.fileName ?? 'file';
+      const caption = descriptor.caption;
+
+      const mxcUri = await appservice.uploadMedia(file.bytes, mediaType, fileName);
+      if (mxcUri) {
+        const isImage = mediaType.startsWith('image/');
+        const isVideo = mediaType.startsWith('video/');
+        const isAudio = mediaType.startsWith('audio/');
+        const msgtype = isImage ? 'm.image' : isVideo ? 'm.video' : isAudio ? 'm.audio' : 'm.file';
+
+        const content: Record<string, unknown> = {
+          msgtype,
+          body: caption ?? fileName,
+          url: mxcUri,
+          info: {
+            mimetype: mediaType,
+            size: file.bytes.length,
+          },
+        };
+
+        eventId = await appservice.sendMessageAs(roomId, ghostUserId, content);
+        console.log(`[bridge] Group file→Matrix: ${senderIdentity} sent ${fileName} (${mediaType})`);
+      } else {
+        throw new Error('upload returned null mxc URI');
+      }
+    } else {
+      throw new Error('resolveGroupFileMessageBody returned null');
+    }
+  } catch (err) {
+    console.warn(`[bridge] Group file download/upload failed for ${senderIdentity}:`, err);
+    eventId = await appservice.sendMessageAs(roomId, ghostUserId, {
+      msgtype: 'm.notice',
+      body: '📎 Sent a file (could not be downloaded)',
+    });
+  }
+
+  if (eventId && messageId !== undefined) {
+    state.addMessageMapping({
+      matrixEventId: eventId,
+      threemaMessageId: String(messageId),
+      roomId,
+      timestamp: Date.now(),
+    });
+  }
 }
 
 // ─── Handle group control messages ───────────────────────────────────────────

@@ -27,7 +27,7 @@ services:
     volumes:
       - ./registration.yaml:/app/registration.yaml:ro
       - ./bbctl-config:/root/.config/bbctl:ro
-    command: ["bbctl", "proxy", "-r", "/app/registration.yaml"]
+    command: ["proxy", "-r", "/app/registration.yaml"]
     networks:
       - bridge-net
 
